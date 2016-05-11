@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import socket
-import urlparse
+from urllib import parse
 import threading
 import logging
 import select
 import time
+import configparser
+from rule import what_rule
 
-HOST = ''                 # Symbolic name meaning all available interfaces
-PORT = 8000              # Arbitrary non-privileged port
-buffer = ""
 
 STATE_INTI = 0
 STATE_EXCEPT = 1
@@ -29,21 +28,23 @@ class Connect(object):
             if not data:
                 self.state = STATE_FINISH
                 return None
-            logging.debug("recv %d data form %s" % (len(data), str(self.addr)))
+            logger.debug("recv %d data form %s" % (len(data), str(self.addr)))
             return data
         except Exception as e:
             self.state = STATE_EXCEPT
-            logging.debug("%s when recv data form %s" % (e, str(self.addr)))
+            logger.exception("%s when recv data form %s" % (e, str(self.addr)))
             return None
 
     def send(self, data):
         try:
+            if isinstance(data, str):
+                data = bytes(data, "utf-8")
             self.conn.sendall(data)
-            logging.debug("send %d data to %s" % (len(data), str(self.addr)))
+            logger.debug("send %d data to %s" % (len(data), str(self.addr)))
             return True
         except Exception as e:
             self.state = STATE_EXCEPT
-            logging.exception("%s when send data to %s" % (e, str(self.addr)))
+            logger.exception("%s when send data to %s" % (e, str(self.addr)))
             return False
 
     def close(self):
@@ -68,10 +69,10 @@ class Server(Connect):
             self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.conn.connect(addr)
             self.addr = addr
-            logging.debug("Connection %s success" % str(addr))
+            logger.debug("Connection %s success" % str(addr))
             return True
         except socket.error as e:
-            logging.error("Connection %s failed" % str(addr))
+            logger.error("Connection %s failed" % str(addr))
             return False
 
 
@@ -80,30 +81,31 @@ class Proxy(threading.Thread):
     def __init__(self, client):
         super(Proxy, self).__init__()
         self.client = client
-        self.client_buffer = "" # store data recv from client
+        self.client_buffer = b"" # store data recv from client
         self.server = None
-        self.server_buffer = "" # store data recv from server
+        self.server_buffer = b"" # store data recv from server
 
     def _get_header(self):
         while True:
-            i = self.client_buffer.find("\r\n\r\n")
+            i = self.client_buffer.find(b"\r\n\r\n")
             if i > 0:
-                logging.debug("get header form %s" % (str(self.client.addr)))
-                return True
+                logger.debug("get header form %s" % (str(self.client.addr)))
+                header, self.client_buffer = self.client_buffer.split(b"\r\n\r\n", 1)
+                return str(header, "utf-8") + "\r\n\r\n"
             else:
                 data = self.client.recv(4096)
                 if data == None:
-                    logging.error("can not get header form %s" % (str(self.client.addr)))
-                    return False
+                    logger.error("can not get header form %s" % (str(self.client.addr)))
+                    return None
                 self.client_buffer += data
 
-    def _parser_header(self):
-        request_line = self.client_buffer.split('\r\n')[0].split(' ')
+    def _parser_header(self, header):
+        request_line = header.split('\r\n')[0].split(' ')
         method = request_line[0]
         full_path = request_line[1]
         version = request_line[2]
         (scm, netloc, path, params, query, fragment) \
-            = urlparse.urlparse(full_path, 'http')
+            = parse.urlparse(full_path, 'http')
         i = netloc.find(':')
         if i >= 0:
             address = netloc[:i], int(netloc[i + 1:])
@@ -111,28 +113,34 @@ class Proxy(threading.Thread):
             address = netloc, 80
         if method == "CONNECT":
             address = (path.split(':')[0], int(path.split(':')[1]))
-        return method, address, scm, netloc, path, params, query, fragment, version
+        return method, address, scm, netloc, path, params, query, fragment, version, full_path
 
-    def _build_header(self, method, address, scm, netloc, path, params, query, fragment, version):
-        header = self.client_buffer
-        header.replace('Proxy-Connection', 'Connection', 1)
-        if method == "GET" or method == "Post":
-            path = urlparse.urlunparse(("", "", path, params, query, ""))
-            header = " ".join([method, path, version]) + "\r\n" +\
-            header.split('\r\n', 1)[-1]
-        self.client_buffer = header
+    def _build_header(self, header, method, address, scm, netloc, path, params, query, fragment, version):
+        # header.replace('Proxy-Connection', "Connection", 1).replace('keep-alive', 'close', 1)
+        # if method == "GET" or method == "Post":
+        #     path = parse.urlunparse(("", "", path, params, query, ""))
+        #     header = " ".join([method, path, version]) + "\r\n" +\
+        #     header.split('\r\n', 1)[-1]
+        return header
 
     def _connect_server(self):
-        if not self._get_header():
+        header = self._get_header()
+        if not header:
             return False
-        method, address, scm, netloc, path, params, query, fragment, version = self._parser_header()
-        self._build_header(method, address, scm, netloc, path, params, query, fragment, version)
-        logging.info("%s %s %s" % (method, address, path))
+        method, address, scm, netloc, path, params, query, fragment, version, full_path \
+         = self._parser_header(header)
+        if what_rule(full_path) == "REJECT":
+            logger.info("REJECT %s according to rules" % full_path)
+            self.client.send("HTTP/1.1" + "Error" + " Fail\r\n\r\n")
+            return False
+        header = self._build_header(header, method, address, scm, netloc, path, params, query, fragment, version)
+        logger.info("%s %s %s" % (method, address, path))
         self.server = Server()
         if self.server.connect(address):
             if method == "CONNECT":
                 self.client.send('HTTP/1.1 200 Connection Established\r\n\r\n')
-                self.client_buffer = ""
+            else:
+                self.server.send(bytes(header, "utf-8"))
             return True
         self.client.send("HTTP/1.1" + "Error" + " Fail\r\n\r\n")
         return False
@@ -157,21 +165,22 @@ class Proxy(threading.Thread):
                     break
             if self.server_buffer:
                 self.client.send(self.server_buffer)
-                self.server_buffer = ""
+                self.server_buffer = b""
             if self.client_buffer:
                 self.server.send(self.client_buffer)
-                self.client_buffer = ""
-        logging.info("complete request from %s to %s" % (str(self.client.addr), str(self.server.addr)))
+                self.client_buffer = b""
+        logger.info("complete request from %s to %s" % (str(self.client.addr), str(self.server.addr)))
         self.client.close()
         self.server.close()
 
-def main(host, port):
-    logging.basicConfig(level=logging.ERROR)
+def main():
+    host = config["SETTING"]["host"]
+    port = config["SETTING"]["port"]
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, port))
+    s.bind((host, int(port)))
     s.listen(500)
-    print("Proxy is serving at %s" % PORT)
+    print("Proxy is serving at %s" % port)
     while True:
         try:
             conn, addr = s.accept()
@@ -184,4 +193,8 @@ def main(host, port):
             break
 
 if __name__ == '__main__':
-    main(HOST, PORT)
+    config = configparser.ConfigParser()
+    config.read("config.conf")
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    main()
